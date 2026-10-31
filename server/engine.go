@@ -148,9 +148,17 @@ type Engine struct {
 	// (for example an exhausted failover chain) — there is no global-pair fallback.
 	resolve              func(t *Task) (*agent.Planner, *agent.Worker)
 	resolveAuthoritative bool
+	workerResolve        func(t *Task, slot WorkerSlot) (*agent.Worker, error)
+	slotState            sync.Map // task/slot -> slotAvailability
+	slotPlans            sync.Map // task -> map[slot name]profile ID; immutable for a run
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
+}
+
+type slotAvailability struct {
+	available bool
+	lastEmit  time.Time
 }
 
 type taskRuntime struct {
@@ -285,6 +293,14 @@ func (e *Engine) StopTask(taskID string) {
 	e.stamped.Delete(taskID)
 	e.inflight.Delete(taskID)
 	e.coordStarted.Delete(taskID)
+	e.slotPlans.Delete(taskID)
+	e.slotState.Range(func(key, _ any) bool {
+		keyText, ok := key.(string)
+		if ok && strings.HasPrefix(keyText, taskID+"/") {
+			e.slotState.Delete(key)
+		}
+		return true
+	})
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()
@@ -715,6 +731,37 @@ func (e *Engine) SetAuthoritativeAgentResolver(fn func(t *Task) (*agent.Planner,
 	e.resolveAuthoritative = true
 }
 
+func (e *Engine) SetWorkerResolver(fn func(t *Task, slot WorkerSlot) (*agent.Worker, error)) {
+	e.workerResolve = fn
+}
+
+func (e *Engine) reportSlotAvailability(t *Task, slot WorkerSlot, err error) {
+	key := t.ID + "/" + slot.Name
+	now := time.Now()
+	value, loaded := e.slotState.LoadOrStore(key, slotAvailability{available: err == nil, lastEmit: now})
+	state := value.(slotAvailability)
+	if err == nil {
+		if loaded && !state.available {
+			e.slotState.Store(key, slotAvailability{available: true, lastEmit: now})
+			e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", Summary: fmt.Sprintf("%s 绑定的 LLM 配置 #%d 已恢复，可以继续领取任务", slot.Name, slot.ProfileID)})
+		}
+		return
+	}
+	if loaded && state.available {
+		state.available = false
+		state.lastEmit = now
+		e.slotState.Store(key, state)
+	} else if loaded && now.Sub(state.lastEmit) < 5*time.Minute {
+		return
+	} else {
+		state = slotAvailability{available: false, lastEmit: now}
+		e.slotState.Store(key, state)
+	}
+	summary := fmt.Sprintf("%s 绑定的 LLM 配置 #%d 不可用（已删除或配置无效），该会话暂停领取任务，不会回退到默认模型", slot.Name, slot.ProfileID)
+	e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", IsError: true, Summary: summary, Detail: err.Error()})
+	log.Printf("[worker %s] task %s pinned profile #%d unavailable: %v", slot.Name, t.ID, slot.ProfileID, err)
+}
+
 // snapshotFor returns the planner/worker a task should run on, from the task-router
 // resolver. nil,nil means the task is deliberately unavailable (e.g. an exhausted
 // failover chain); there is no global-pair fallback.
@@ -746,7 +793,11 @@ func (e *Engine) ReadyFor(t *Task) bool {
 // but no-op until an LLM is configured (so a task created while idle picks up
 // automatically once LLM is set from the UI).
 func (e *Engine) Run(ctx context.Context, t *Task) {
-	workers := e.m.Workers()
+	slots, err := workerSlotsForTask(t, e.m.WorkerPools(), e.m.Workers())
+	if err != nil {
+		log.Printf("[engine] task %s worker pool invalid, using legacy workers: %v", t.ID, err)
+		slots, _ = ExpandWorkerSlots(nil, workerCountForTask(t, e.m.Workers()))
+	}
 	e.deleteMu.RLock()
 	if e.IsDeleting(t.ID) {
 		e.deleteMu.RUnlock()
@@ -757,13 +808,18 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		t.Notify() // already running — just nudge a planning round
 		return
 	}
-	rt := e.registerTaskRoutines(ctx, t.ID, 1+workers)
+	rt := e.registerTaskRoutines(ctx, t.ID, 1+len(slots))
+	plan := make(map[string]int64, len(slots))
+	for _, slot := range slots {
+		plan[slot.Name] = slot.ProfileID
+	}
+	e.slotPlans.Store(t.ID, plan)
 	e.deleteMu.RUnlock()
 	e.touch(t.ID)
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
-	for i := 0; i < workers; i++ {
-		name := fmt.Sprintf("work#%d", i+1)
-		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, name) })
+	for _, slot := range slots {
+		slot := slot
+		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, slot) })
 	}
 	e.startDeadlineCoordinator(ctx, t) // 任务级超时定时器(仅 timeout>0;去重)
 	// 仅在「完全没有活动意图(open+running)」时才 kick 首轮规划。带种子意图的任务:种子已
@@ -774,6 +830,27 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	if has, _ := t.Store.HasActiveIntent(); !has {
 		t.Notify() // kick the first planning round (acted on once LLM is ready)
 	}
+}
+
+// workerSlotsForTask preserves an explicit task concurrency override. Tasks
+// using the global default inherit its model pools and their pinned profiles.
+func workerSlotsForTask(t *Task, pools []WorkerPool, global int) ([]WorkerSlot, error) {
+	if t != nil && t.WorkerCount > 0 {
+		return ExpandWorkerSlots(nil, workerCountForTask(t, global))
+	}
+	return ExpandWorkerSlots(pools, global)
+}
+
+func workerCountForTask(t *Task, global int) int {
+	if t != nil && t.WorkerCount > 0 {
+		// Direct database edits can bypass validation; cap those values so the
+		// engine never starts more than the supported per-task worker count.
+		if t.WorkerCount > db.MaxTaskWorkerCount {
+			return db.MaxTaskWorkerCount
+		}
+		return t.WorkerCount
+	}
+	return global
 }
 
 // plannerHeartbeatInterval 解析任务的 planner 心跳间隔。db.CreateTask 已归一
@@ -860,6 +937,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			return
 		}
 		defer e.decInflight(t.ID)
+		if err := e.m.StartTaskRunSegment(t.ID); err != nil {
+			log.Printf("[runtime] task %s start segment failed: %v", t.ID, err)
+		}
 		e.stampFirstRun(t) // 首次真正规划 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 		e.touch(t.ID)
 		emit := func(r db.Activity) { e.emitActivity(t, r) }
@@ -913,14 +993,32 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	}
 }
 
-func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
+func (e *Engine) workerLoop(ctx context.Context, t *Task, slot WorkerSlot) {
+	name := slot.Name
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		_, worker := e.snapshotFor(t)
+		var worker *agent.Worker
+		var resolveErr error
+		if slot.ProfileID > 0 {
+			if e.workerResolve == nil {
+				resolveErr = errors.New("pinned worker resolver unavailable")
+			} else {
+				worker, resolveErr = e.workerResolve(t, slot)
+				if worker == nil && resolveErr == nil {
+					resolveErr = errors.New("pinned worker resolver returned no worker")
+				}
+			}
+			e.reportSlotAvailability(t, slot, resolveErr)
+			if resolveErr != nil {
+				worker = nil
+			}
+		} else {
+			_, worker = e.snapshotFor(t)
+		}
 		if worker == nil {
 			if sleepCtx(ctx, 1500*time.Millisecond) {
 				return
@@ -990,6 +1088,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			log.Printf("[worker %s] task %s 意图 #%d 领取后回退失败: %v", name, t.ID, intent.ID, err)
 		}
 		return true
+	}
+	if err := e.m.StartTaskRunSegment(t.ID); err != nil {
+		log.Printf("[runtime] task %s start segment failed: %v", t.ID, err)
 	}
 	// per-work child context so the planner's kill_work can stop just this work.
 	workCtx, workCancel := context.WithCancelCause(ectx)
@@ -1178,16 +1279,36 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 			e.decInflight(t.ID)
 		}
 	}()
-	_, worker := e.snapshotFor(t)
-	if worker == nil {
-		return fmt.Errorf("worker 尚未就绪")
-	}
 	node, err := t.Store.GetNode(intentID)
 	if err != nil {
 		return err
 	}
 	if node == nil || node.Kind != db.KindIntent {
 		return fmt.Errorf("intent not found")
+	}
+	owner := node.Owner
+	var worker *agent.Worker
+	if value, ok := e.slotPlans.Load(t.ID); ok {
+		if plan, ok := value.(map[string]int64); ok {
+			if profileID, pinned := plan[owner]; pinned && profileID > 0 {
+				if e.workerResolve == nil {
+					return fmt.Errorf("意图所属的 LLM 配置 #%d 不可用：pinned worker resolver unavailable", profileID)
+				}
+				worker, err = e.workerResolve(t, WorkerSlot{Name: owner, ProfileID: profileID})
+				if err != nil || worker == nil {
+					if err == nil {
+						err = errors.New("worker resolver returned no worker")
+					}
+					return fmt.Errorf("意图所属的 LLM 配置 #%d 不可用：%w", profileID, err)
+				}
+			}
+		}
+	}
+	if worker == nil {
+		_, worker = e.snapshotFor(t)
+		if worker == nil {
+			return fmt.Errorf("worker 尚未就绪")
+		}
 	}
 	changed, err := t.Store.CompareAndSetIntentState(intentID, "paused", "running")
 	if err != nil {

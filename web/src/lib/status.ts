@@ -63,6 +63,14 @@ const severity: Record<string, StatusMeta> = {
   low: { label: "低危", tone: "slate" },
 };
 
+export const SEVERITY_FILTER_OPTIONS = [
+  ["all", "全部"],
+  ["critical", severity.critical.label],
+  ["high", severity.high.label],
+  ["medium", severity.medium.label],
+  ["low", severity.low.label],
+] as const;
+
 const finding: Record<string, StatusMeta> = {
   pending: { label: "待处理", tone: "amber" },
   in_progress: { label: "处理中", tone: "blue" },
