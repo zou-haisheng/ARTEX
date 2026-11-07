@@ -5,7 +5,7 @@
 AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 
-🌐 **在线 Demo**： [https://artex-demo-ruoji6.vercel.app](https://vercel.com/haisheng-zou/artex-demo)
+🌐 **在线 Demo**： [https://artex-demo-zou-haisheng.vercel.app](https://artex-demo-zou-haisheng.vercel.app)
 
 </div>
 
@@ -16,7 +16,7 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 ## 截图预览
 
-> 完整交互见[在线 Demo](https://vercel.com/haisheng-zou/artex-demo)。
+> 完整交互见[在线 Demo](https://artex-demo-zou-haisheng.vercel.app)。
 
 | 仪表盘（总览 / Token 消耗 / 活动流） | 任务列表 |
 | :---: | :---: |
