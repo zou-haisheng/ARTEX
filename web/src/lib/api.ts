@@ -34,8 +34,6 @@ import type {
   DeleteTaskResult,
   Edge,
   EgressReport,
-  ProxyPoolEntry,
-  ProxySwitchLog,
   EvidenceBodyPreview,
   ExplorationNodePage,
   ExplorationNodeQuery,
@@ -54,8 +52,6 @@ import type {
   FindingsPage,
   FindingTraffic,
   FindingTrafficDetail,
-  RepeaterSendRequest,
-  RepeaterSendResponse,
   IntelligencePage,
   IntentAsset,
   InterceptApprovalFilter,
@@ -82,6 +78,10 @@ import type {
   NotificationMeta,
   PromptVar,
   PromptVersion,
+  ProxyPoolEntry,
+  ProxySwitchLog,
+  RepeaterSendRequest,
+  RepeaterSendResponse,
   SessionTokenUsage,
   Settings,
   Severity,
@@ -90,6 +90,7 @@ import type {
   SSProject,
   SSTask,
   Stats,
+  SystemMetrics,
   Task,
   TaskArchive,
   TaskArchivePage,
@@ -118,7 +119,6 @@ import type {
   UsageStats,
   WorkspaceFile,
   WorkspaceListing,
-  SystemMetrics,
 } from "@/lib/types";
 
 /**
@@ -144,28 +144,21 @@ function getToken(): string | null {
   return localStorage.getItem("artex_token");
 }
 
-let basicAuthReloading = false;
-let basicAuthProbe: Promise<void> | null = null;
-
-// Renew the outer gate through a page navigation, where the browser can send
-// Basic credentials without replacing an API request's Bearer authorization.
-// Keep the admin token and collapse concurrent failures into one reload.
-export async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
-  if (basicAuthReloading) throw new Error("访问验证已过期，正在重新验证");
-  const response = await fetch(input, init);
-  if (basicAuthReloading) throw new Error("访问验证已过期，正在重新验证");
-  if (response.status === 401 && response.headers.get("X-Artex-Auth") === "basic") {
-    basicAuthReloading = true;
-    window.location.reload();
-    throw new Error("访问验证已过期，正在重新验证");
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly code?: string,
+    public readonly params?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "ApiError";
   }
-  return response;
 }
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   const token = getToken();
-  const r = await apiFetch(`/api${path}`, {
+  const r = await fetch(`/api${path}`, {
     ...init,
     headers: {
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
@@ -173,26 +166,29 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       ...(init?.headers as Record<string, string> | undefined),
     },
   });
-  if (r.status === 401) {
-    if (typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
-      window.location.href = "/login";
-    }
-    throw new Error("未授权");
-  }
   if (!r.ok) {
-    const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
+    const fallback = r.status === 401 ? "未授权" : `${init?.method ?? "GET"} ${path}: ${r.status}`;
     let message = fallback;
+    let code: string | undefined = r.status === 401 ? "unauthorized" : undefined;
+    let params: Record<string, unknown> | undefined;
     try {
-      const payload = (await r.json()) as { error?: unknown };
+      const payload = (await r.json()) as { error?: unknown; code?: unknown; params?: unknown };
       if (typeof payload.error === "string" && payload.error.trim()) {
         message = payload.error.trim();
+      }
+      if (typeof payload.code === "string") code = payload.code;
+      if (payload.params && typeof payload.params === "object" && !Array.isArray(payload.params)) {
+        params = payload.params as Record<string, unknown>;
       }
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    throw new Error(message);
+    if (r.status === 401 && typeof window !== "undefined") {
+      localStorage.removeItem("artex_token");
+      document.cookie = "artex_token=; path=/; max-age=0";
+      window.location.href = "/login";
+    }
+    throw new ApiError(message, code, params);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -254,19 +250,7 @@ export function openSSE(path: string): EventSource {
   // Same-origin streams already send cookies. Only opt into cross-port cookies
   // for the local Next/Go dev pair; keep custom remote SSE endpoints unchanged.
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(target.hostname);
-  const source = new EventSource(url, { withCredentials: local && target.hostname === window.location.hostname });
-  source.addEventListener("error", () => {
-    // EventSource hides the response status. Probe a same-origin auth endpoint
-    // to distinguish an expired gate from an ordinary stream/network failure.
-    if (basicAuthProbe !== null || basicAuthReloading) return;
-    basicAuthProbe = apiFetch("/api/auth/status", { cache: "no-store" })
-      .then(() => undefined)
-      .catch(() => undefined)
-      .finally(() => {
-        basicAuthProbe = null;
-      });
-  });
-  return source;
+  return new EventSource(url, { withCredentials: local && target.hostname === window.location.hostname });
 }
 
 const get = <T>(p: string) => http<T>(p);
@@ -412,8 +396,10 @@ export const api = {
   runScheduleNow: (id: number) =>
     post<{ ok: boolean; started: number; errors?: string[] }>(`/schedules/${id}/run-now`, {}),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
-  updateTask: (id: string, input: { name?: string; pinned?: boolean; remark?: string; share_global_assets?: boolean }) =>
-    patch<Task>(`/tasks/${id}`, input),
+  updateTask: (
+    id: string,
+    input: { name?: string; pinned?: boolean; remark?: string; share_global_assets?: boolean },
+  ) => patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),
@@ -429,11 +415,19 @@ export const api = {
     }),
   taskTemplates: () => get<{ templates: TaskTemplate[] }>("/task-templates").then((r) => arr(r.templates)),
   createTaskTemplate: (
-    input: Pick<TaskTemplate, "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count">,
+    input: Pick<
+      TaskTemplate,
+      "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count"
+    >,
   ) => post<TaskTemplate>("/task-templates", input),
   updateTaskTemplate: (
     id: number,
-    input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count">>,
+    input: Partial<
+      Pick<
+        TaskTemplate,
+        "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count"
+      >
+    >,
   ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
   deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
   updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>
@@ -584,7 +578,7 @@ export const api = {
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
     const token = getToken();
-    const r = await apiFetch(`/api/workspace/upload?path=${encodeURIComponent(dir)}`, {
+    const r = await fetch(`/api/workspace/upload?path=${encodeURIComponent(dir)}`, {
       method: "POST",
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
@@ -599,7 +593,7 @@ export const api = {
       blob = new Blob([`（demo）${path} 的下载内容示例。`], { type: "text/plain" });
     } else {
       const token = getToken();
-      const r = await apiFetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
+      const r = await fetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       });
       if (!r.ok) throw new Error(`下载失败: ${r.status}`);
@@ -759,7 +753,7 @@ export const api = {
       for (const [k, v] of findingFilterParams(opts.filters)) p.set(k, v);
     }
     const token = getToken();
-    const r = await apiFetch(`/api/exploration/findings/export?${p.toString()}`, {
+    const r = await fetch(`/api/exploration/findings/export?${p.toString()}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!r.ok) throw new Error(`export: ${r.status}`);
@@ -837,7 +831,7 @@ export const api = {
     contextTask?: string,
   ) => {
     const token = getToken();
-    const response = await apiFetch(
+    const response = await fetch(
       `/api/exploration/findings/${id}/traffic/${bindingId}/body?side=${side}&download=1${contextTask ? `&context_task=${encodeURIComponent(contextTask)}` : ""}`,
       { headers: token ? { Authorization: `Bearer ${token}` } : {} },
     );
@@ -1008,7 +1002,25 @@ export const api = {
 
   // ---- app settings (runtime toggles) ----
   intelligence: (scope: "tasks" | "assets", id: string, query: URLSearchParams) =>
-    get<IntelligencePage>(`/${scope}/${id}/intelligence?${query.toString()}`),
+    get<IntelligencePage>(`/${scope}/${id}/intelligence?${query.toString()}`).then((page) => {
+      if (
+        !page ||
+        !Array.isArray(page.items) ||
+        !page.counts ||
+        typeof page.counts !== "object" ||
+        Array.isArray(page.counts) ||
+        !["credential", "lead", "sensitive_data"].every((kind) => {
+          const count = page.counts[kind as keyof typeof page.counts];
+          return Number.isSafeInteger(count) && count >= 0;
+        }) ||
+        !Number.isSafeInteger(page.total) ||
+        page.total < 0 ||
+        typeof page.enabled !== "boolean"
+      ) {
+        throw new ApiError("情报数据响应不完整，请刷新后重试", "intelligence_response_invalid");
+      }
+      return page;
+    }),
   intelligenceDetail: (scope: "tasks" | "assets", id: string, intelligenceId: number) =>
     get<TaskIntelligence>(`/${scope}/${id}/intelligence/${intelligenceId}`),
   updateIntelligence: (taskId: number, intelligenceId: number, status: string) =>
@@ -1070,7 +1082,15 @@ export const api = {
   // ---- 漏洞 IM 推送 ----
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
-  notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
+  notifyMeta: () =>
+    get<NotificationMeta>(`/notify/meta`).then((meta) => {
+      // An empty demo/proxy response must enter the page's load-error path,
+      // rather than crash the render when it reads kinds.find or stats.
+      if (!meta || !Array.isArray(meta.kinds) || !meta.stats || !meta.defaults) {
+        throw new Error("通知配置响应不完整，请刷新后重试");
+      }
+      return meta;
+    }),
   notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
@@ -1111,7 +1131,7 @@ export const api = {
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
     const token = getToken();
-    const r = await apiFetch(`/api/report${tq(task)}`, {
+    const r = await fetch(`/api/report${tq(task)}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!r.ok) throw new Error(`report: ${r.status}`);
@@ -1139,7 +1159,7 @@ export const api = {
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
     const token = getToken();
-    const r = await apiFetch(`/api/chat/upload?scope=${scope}&id=${encodeURIComponent(id)}`, {
+    const r = await fetch(`/api/chat/upload?scope=${scope}&id=${encodeURIComponent(id)}`, {
       method: "POST",
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
@@ -1399,7 +1419,7 @@ export const api = {
     const fd = new FormData();
     fd.append("file", file);
     const token = getToken();
-    const r = await apiFetch(`/api/skills/upload${overwrite ? "?overwrite=true" : ""}`, {
+    const r = await fetch(`/api/skills/upload${overwrite ? "?overwrite=true" : ""}`, {
       method: "POST",
       body: fd,
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -1488,7 +1508,7 @@ export const api = {
   interceptGetToolConfig: async (): Promise<{ enabled_tools: string[] }> => {
     if (MOCK) return { enabled_tools: ["bash"] };
     const token = getToken();
-    const r = await apiFetch("/api/intercept/tool-config", {
+    const r = await fetch("/api/intercept/tool-config", {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!r.ok) throw new Error(await r.text());
@@ -1497,7 +1517,7 @@ export const api = {
   interceptSetToolConfig: async (enabledTools: string[]): Promise<void> => {
     if (MOCK) return;
     const token = getToken();
-    const r = await apiFetch("/api/intercept/tool-config", {
+    const r = await fetch("/api/intercept/tool-config", {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
